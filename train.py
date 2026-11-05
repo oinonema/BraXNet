@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-""" ImageNet Training Script
-
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
-
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
-
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
-"""
 import argparse
 import time
 import yaml
@@ -49,14 +33,11 @@ from timm.utils import ApexScaler, NativeScaler
 import models
 
 
-class ProgressiveSoftAsymmetricLoss(nn.Module):
+
+class PSALoss(nn.Module):
     """
-    1. SnapMix软标签：使用标准SoftTargetCrossEntropy形式
-    2. 硬标签/简单软标签：可以使用Asymmetric Loss优化
-    3. 简化的Asymmetric Focusing
-    4. SnapMix自适应加权
+    Progressive Soft Asymmetric Loss (PSALoss)
     """
- 
     def __init__(self, 
                  gamma_neg=2.0, 
                  gamma_pos=0.5, 
@@ -66,9 +47,9 @@ class ProgressiveSoftAsymmetricLoss(nn.Module):
                  total_epochs=150,
                  smoothing=0.1, 
                  reduction='mean',
-                 mixup_adaptive_weight=True,
-                 progressive_combination=True,
-                 use_asymmetric_loss=True):
+                 adaptive_weight=True,
+                 progressive_enabled=True,
+                 use_psa_loss=True):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
@@ -78,18 +59,23 @@ class ProgressiveSoftAsymmetricLoss(nn.Module):
         self.total_epochs = total_epochs
         self.smoothing = smoothing
         self.reduction = reduction
-        self.mixup_adaptive_weight = mixup_adaptive_weight
-        self.progressive_combination = progressive_combination
-        self.use_asymmetric_loss = use_asymmetric_loss
+        self.adaptive_weight = adaptive_weight
+        self.progressive_enabled = progressive_enabled
+        self.use_psa_loss = use_psa_loss
         
         self.current_epoch = 0
     
     def set_epoch(self, epoch):
-        """设置当前训练epoch，用于渐进式权重计算"""
         self.current_epoch = epoch
     
+    def progressive_adjust(self, epoch=None, total_epochs=None):
+        if epoch is not None:
+            self.current_epoch = epoch
+        if total_epochs is not None:
+            self.total_epochs = total_epochs
+        return self.get_progressive_weight()
+    
     def get_progressive_weight(self):
-        """计算渐进式权重"""
         if self.current_epoch < self.warmup_epochs:
             return 0.0
         elif self.current_epoch >= self.total_epochs * 0.8:
@@ -100,9 +86,6 @@ class ProgressiveSoftAsymmetricLoss(nn.Module):
             return torch.sigmoid(torch.tensor(sigmoid_input, dtype=torch.float32, device=next(self.parameters()).device if list(self.parameters()) else torch.device('cpu'))).item()
     
     def forward(self, pred, target, lam_a=None, lam_b=None, epoch=None, total_epochs=None):
-        """
-        计算ProgressiveSoftAsymmetricLoss
-        """
         if epoch is not None:
             self.current_epoch = epoch
         if total_epochs is not None:
@@ -111,182 +94,135 @@ class ProgressiveSoftAsymmetricLoss(nn.Module):
         num_classes = pred.size(-1)
         batch_size = pred.size(0)
         
-        # 检查是否为SnapMix混合软标签
-        is_snapmix = lam_b is not None and lam_b.sum().item() > 0
-        
-        # 计算渐进式权重
-        if self.progressive_combination and self.use_asymmetric_loss:
-            asym_weight = self.get_progressive_weight()
+        if self.progressive_enabled and self.use_psa_loss:
+            w_as = self.get_progressive_weight()
         else:
-            asym_weight = 0.0
+            w_as = 0.0
         
-        # 对于SnapMix混合标签，主要使用标准SoftTargetCrossEntropy形式
-        # Asymmetric Loss作为辅助优化
-        if is_snapmix:
-            # SnapMix模式：使用更稳定的损失计算
-            # 主要使用softmax + cross entropy的软标签形式
-            log_probs = F.log_softmax(pred, dim=-1)
-            
-            # 标签平滑
-            if self.smoothing > 0:
-                target_smooth = target * (1 - self.smoothing) + self.smoothing / num_classes
-            else:
-                target_smooth = target
-            
-            # 软标签交叉熵损失
-            loss = -(target_smooth * log_probs).sum(dim=-1)
-            
-            # SnapMix自适应加权：对高度混合的样本降低权重
-            if self.mixup_adaptive_weight and lam_b is not None:
-                lam_a = lam_a.view(-1)
-                lam_b = lam_b.view(-1)
-                
-                # 混合比例接近0.5时不确定性最高
-                mix_uncertainty = torch.sin(lam_b * np.pi)
-                boundary_factor = 1 - torch.abs(lam_a - 0.5) * 2
-                boundary_factor = boundary_factor.clamp(min=0, max=1)
-                
-                # 对高不确定性样本降低权重
-                adaptive_weight = 1.0 - 0.15 * mix_uncertainty * boundary_factor
-                loss = loss * adaptive_weight
-            
-            if self.reduction == 'mean':
-                return loss.mean()
-            elif self.reduction == 'sum':
-                return loss.sum()
-            return loss
+        log_probs = F.log_softmax(pred, dim=-1)
         
-        # 非SnapMix模式（硬标签或简单软标签）：可以使用Asymmetric Loss优化
+        if self.smoothing > 0:
+            target_smooth = target * (1 - self.smoothing) + self.smoothing / num_classes
         else:
-            # 应用label smoothing
-            if self.smoothing > 0:
-                target_smooth = target * (1 - self.smoothing) + self.smoothing / num_classes
+            target_smooth = target
+        
+        loss_ce = -(target_smooth * log_probs).sum(dim=-1)  # [B]
+        
+        # Asymmetric Loss 
+        if w_as > 0 and self.use_psa_loss:
+            probs = pred.softmax(dim=-1)
+            if self.clip is not None and self.clip > 0:
+                probs_clipped = probs.clamp(min=self.clip, max=1 - self.clip)
             else:
-                target_smooth = target
+                probs_clipped = probs
             
-            # 标准SoftTargetCrossEntropy形式
-            log_probs = F.log_softmax(pred, dim=-1)
-            loss = -(target_smooth * log_probs).sum(dim=-1)
-            
-            # 渐进式Asymmetric Loss增强
-            if asym_weight > 0 and self.use_asymmetric_loss:
-                # 计算预测概率
-                probs = pred.softmax(dim=-1)
-                
-                # Asymmetric Clipping
-                if self.clip is not None and self.clip > 0:
-                    probs_clipped = probs.clamp(min=self.clip, max=1 - self.clip)
-                else:
-                    probs_clipped = probs
-                
-                # 计算Asymmetric Loss分量
-                p_t = probs_clipped * target_smooth + (1 - probs_clipped) * (1 - target_smooth)
-                
-                # Focusing权重
-                focusing_weight = torch.pow(1 - p_t, torch.where(
-                    target_smooth > 0.5,
-                    torch.tensor(self.gamma_pos, device=pred.device),
-                    torch.tensor(self.gamma_neg, device=pred.device)
-                ))
-                
-                # Asymmetric Loss
-                asym_loss = torch.where(
-                    target_smooth > 0.5,
-                    -((1 - probs_clipped) ** self.gamma_pos) * torch.log(probs_clipped + self.eps),
-                    -(probs_clipped ** self.gamma_neg) * torch.log(1 - probs_clipped + self.eps)
-                ).sum(dim=-1)
-                
-                # 组合损失
-                loss = loss * (1 - asym_weight) + asym_loss * asym_weight
-            
-            if self.reduction == 'mean':
-                return loss.mean()
-            elif self.reduction == 'sum':
-                return loss.sum()
-            return loss
+            pos_term = -((1 - probs_clipped) ** self.gamma_pos) * torch.log(probs_clipped + self.eps)
+            neg_term = -(probs_clipped ** self.gamma_neg) * torch.log(1 - probs_clipped + self.eps)
+            loss_as = torch.where(target_smooth > 0.5, pos_term, neg_term).sum(dim=-1)  # [B]
+        else:
+            loss_as = torch.zeros_like(loss_ce)
+        
+        loss_original = loss_ce * (1 - w_as) + loss_as * w_as
 
-class SnapMixCAM:
+        if lam_b is not None and lam_a is not None:
+            lam_a_v = lam_a.view(-1).float()
+            lam_b_v = lam_b.view(-1).float()
+
+            mixed = (lam_b_v > 0).to(loss_ce.dtype)  # [B]
+            
+            if self.adaptive_weight:
+                mix_uncertainty = torch.sin(lam_b_v * np.pi)
+                boundary_factor = (1 - torch.abs(lam_a_v - 0.5) * 2).clamp(min=0, max=1)
+                adaptive_weight = 1.0 - 0.15 * mix_uncertainty * boundary_factor
+            else:
+                adaptive_weight = torch.ones_like(lam_b_v)
+            
+            loss_mixed = loss_ce * adaptive_weight
+            
+            loss = mixed * loss_mixed + (1 - mixed) * loss_original
+        else:
+            loss = loss_original
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
+class ActivationMapExtractor:
     """
-    简化的CAM计算器,
-    采用简化的激活图方法，避免复杂的梯度计算
+    Activation-Guided CutMix、class-agnostic activation map
     """
     def __init__(self, model, debug=False):
         self.model = model
-        self.cached_cam = None
+        self.cached_activation_map = None
         self.debug = debug
         self.call_count = 0
         self.failed_count = 0
         
-        # 检查模型结构
         self.has_forward_embeddings = hasattr(model, 'forward_embeddings')
         self.has_forward_tokens = hasattr(model, 'forward_tokens')
         self.has_fork_feat = hasattr(model, 'fork_feat')
         
         if debug:
-            print(f"[SnapMixCAM] Model structure check:")
+            print(f"[ActivationMapExtractor] Model structure check:")
             print(f"  - has forward_embeddings: {self.has_forward_embeddings}")
             print(f"  - has forward_tokens: {self.has_forward_tokens}")
             print(f"  - has fork_feat: {self.has_fork_feat}")
         
-    def compute_cam(self, input_tensor, target_class):
-        """
-        计算简化的CAM（使用特征激活作为重要性）
-        返回上采样到原始图像分辨率的CAM
-        """
+    def compute_activation_map(self, input_tensor, target_class):
+
         self.call_count += 1
+        
+
+        was_training = self.model.training
         
         try:
             self.model.eval()
             
             with torch.no_grad():
-                # 根据模型结构选择合适的方法获取特征
+
                 if self.has_forward_embeddings and self.has_forward_tokens:
-                    # TransXNet结构
                     x = self.model.forward_embeddings(input_tensor)
                     multi_scale_features = self.model.forward_tokens(x)
                 else:
-                    # 备用：使用完整forward
                     multi_scale_features = self.model.forward(input_tensor)
                 
-                # 使用最后一个stage的特征
                 if isinstance(multi_scale_features, list):
                     last_feature = multi_scale_features[-1]  # [B, C, H', W']
                 else:
                     last_feature = multi_scale_features
                 
-                # 获取原始图像尺寸
                 orig_h, orig_w = input_tensor.shape[2], input_tensor.shape[3]
                 feat_h, feat_w = last_feature.shape[2], last_feature.shape[3]
                 
-                # 简化的CAM：使用通道平均激活
-                cam = last_feature.mean(dim=1, keepdim=False)  # [B, H', W']
+                act_map = last_feature.mean(dim=1, keepdim=False)  # [B, H', W']
                 
-                # 上采样到原始分辨率
                 if feat_h != orig_h or feat_w != orig_w:
-                    cam = torch.nn.functional.interpolate(
-                        cam.unsqueeze(1),  # [B, 1, H', W']
+                    act_map = torch.nn.functional.interpolate(
+                        act_map.unsqueeze(1),  # [B, 1, H', W']
                         size=(orig_h, orig_w),
                         mode='bilinear',
                         align_corners=False
                     ).squeeze(1)  # [B, H, W]
                 
-                # 对每个batch样本进行ReLU和归一化
-                cams = []
-                for i in range(cam.size(0)):
-                    cam_i = cam[i]
-                    if cam_i.max() > 0:
-                        cam_i = cam_i / cam_i.max()
-                    cams.append(torch.relu(cam_i))
+                act_maps = []
+                for i in range(act_map.size(0)):
+                    act_map_i = act_map[i]
+                    if act_map_i.max() > 0:
+                        act_map_i = act_map_i / act_map_i.max()
+                    act_maps.append(torch.relu(act_map_i))
                 
-                result = torch.stack(cams, dim=0)  # [B, H, W]
+                result = torch.stack(act_maps, dim=0)  # [B, H, W]
                 
                 if self.debug and self.call_count <= 3:
-                    print(f"[SnapMixCAM Debug #{self.call_count}]")
+                    print(f"[ActivationMapExtractor Debug #{self.call_count}]")
                     print(f"  Input shape: {input_tensor.shape}")
                     print(f"  Feature shape: {last_feature.shape}")
-                    print(f"  CAM shape: {result.shape}")
-                    print(f"  CAM stats: min={result.min().item():.4f}, max={result.max().item():.4f}, mean={result.mean().item():.4f}")
-                    print(f"  CAM variance (spatial importance): {result.var().item():.6f}")
+                    print(f"  Activation map shape: {result.shape}")
+                    print(f"  Activation map stats: min={result.min().item():.4f}, max={result.max().item():.4f}, mean={result.mean().item():.4f}")
+                    print(f"  Activation map variance (spatial importance): {result.var().item():.6f}")
                 
                 return result
                 
@@ -294,87 +230,105 @@ class SnapMixCAM:
             self.failed_count += 1
             if self.debug:
                 import traceback
-                print(f"[SnapMixCAM Error #{self.failed_count}] {e}")
+                print(f"[ActivationMapExtractor Error #{self.failed_count}] {e}")
                 traceback.print_exc()
             return None
+        finally:
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()
     
     def get_stats(self):
-        """获取CAM计算统计"""
+        """获取激活图计算统计"""
         return {
             'total_calls': self.call_count,
             'failed_calls': self.failed_count,
             'success_rate': (self.call_count - self.failed_count) / max(self.call_count, 1)
         }
 
-class CutMixFunc:
-    """CutMix augmentation with CAM-guided mixing for medical imaging"""
+class ActivationGuidedCutMix:
+    """Activation-Guided CutMix: activation-map-guided mixing for medical imaging"""
 
     def __init__(self, model, beta=1.0, prob=1.0, num_classes=4, use_cls_weights=False,
-                 cam_enabled=True, cam_layer='last', debug=False, save_visualizations=None):
+                 activation_enabled=True, activation_layer='last', debug=False, save_visualizations=None):
         self.model = model
         self.beta = beta
         self.prob = prob
         self.num_classes = num_classes
         self.use_cls_weights = use_cls_weights
-        self.cam_enabled = cam_enabled
-        self.cam_layer = cam_layer
+        self.activation_enabled = activation_enabled
+        self.activation_layer = activation_layer
         self.debug = debug
-        self.save_visualizations = save_visualizations  # e.g., './snapmix_debug'
+        self.save_visualizations = save_visualizations  # e.g., './act_cutmix_debug'
         self.model.eval()
-        self.cam_calculator = None
+        self.activation_map_extractor = None
         self.visual_count = 0
         
-        # 初始化CAM计算器
-        if self.cam_enabled:
-            try:
-                self.cam_calculator = SnapMixCAM(model, debug=debug)
-                _logger.info("SnapMix CAM-guided augmentation enabled")
-            except Exception as e:
-                _logger.warning(f"Failed to initialize CAM calculator, using fallback: {e}")
-                self.cam_calculator = None
 
-    def get_spm(self, input, target):
+        if self.activation_enabled:
+            try:
+                self.activation_map_extractor = ActivationMapExtractor(model, debug=debug)
+                _logger.info("Activation-Guided CutMix with activation-map guidance enabled")
+            except Exception as e:
+                _logger.warning(f"Failed to initialize activation map extractor, using fallback: {e}")
+                self.activation_map_extractor = None
+
+    def get_activation_map(self, input, target):
         """
-        Generate Semantic Activation Map (SAM/CAM) for SnapMix
-        Uses gradient-based Grad-CAM to identify semantically important regions
+        Generate the class-agnostic activation map for Activation-Guided CutMix
+        Uses the channel-averaged last-stage feature activation to identify semantically important regions
         """
-        if self.cam_calculator is None:
+        if self.activation_map_extractor is None:
             return None, None
         
-        # 计算真正的Grad-CAM
-        cam = self.cam_calculator.compute_cam(input, target)
-        return cam, None
+        act_map = self.activation_map_extractor.compute_activation_map(input, target)
+        return act_map, None
 
     def _extract_features(self, x):
-        """Extract intermediate features for CAM computation - deprecated, use SnapMixCAM"""
+        """Extract intermediate features for activation map computation - deprecated, use ActivationMapExtractor"""
         return None
 
-    def _compute_cam(self, features, target):
-        """Compute Class Activation Map - deprecated, use SnapMixCAM"""
+    def _compute_activation_map(self, features, target):
+        """Compute activation map - deprecated, use ActivationMapExtractor"""
         return None
 
     def rand_bbox(self, size, lam):
-        """Generate random bounding box for mixing"""
+        """
+        Generate a random bounding box for mixing (per-sample).
+        Args:
+            size: [B, C, H, W]
+            lam: scalar or array of per-sample keep-ratio (original area fraction)
+        Returns:
+            list of (x1, y1, x2, y2) per sample
+        """
         W = size[-1]
         H = size[-2]
-        cut_rat = np.sqrt(1. - lam)
-        cut_w = int(W * cut_rat)
-        cut_h = int(H * cut_rat)
+        bs = size[0]
+        lam_arr = np.asarray(lam, dtype=np.float64).reshape(-1)
+        if lam_arr.size == 1:
+            lam_arr = np.repeat(lam_arr, bs)
 
-        # Random center point
-        cx = np.random.randint(W)
-        cy = np.random.randint(H)
+        boxes = []
+        for b in range(bs):
+            cut_rat = np.sqrt(1. - float(lam_arr[b]))
+            cut_w = int(W * cut_rat)
+            cut_h = int(H * cut_rat)
 
-        bbx1 = np.clip(cx - cut_w // 2, 0, W)
-        bby1 = np.clip(cy - cut_h // 2, 0, H)
-        bbx2 = np.clip(cx + cut_w // 2, 0, W)
-        bby2 = np.clip(cy + cut_h // 2, 0, H)
+            # Random center point
+            cx = np.random.randint(W)
+            cy = np.random.randint(H)
 
-        return bbx1, bby1, bbx2, bby2
+            x1 = int(np.clip(cx - cut_w // 2, 0, W))
+            y1 = int(np.clip(cy - cut_h // 2, 0, H))
+            x2 = int(np.clip(cx + cut_w // 2, 0, W))
+            y2 = int(np.clip(cy + cut_h // 2, 0, H))
+            boxes.append((x1, y1, x2, y2))
+        return boxes
 
     def __call__(self, input, target):
         """
-        Apply SnapMix augmentation with CAM-guided mixing
+        Apply Activation-Guided CutMix with activation-map-guided mixing
 
         Args:
             input: Input images [B, C, H, W]
@@ -384,95 +338,76 @@ class CutMixFunc:
             mixed_input: Augmented images
             target_a: Original labels
             target_b: Mixed labels (from random batch)
-            lam_a: Mixing coefficient for original
-            lam_b: Mixing coefficient for mixed
+            lam_a: Mixing coefficient for original (per-sample)
+            lam_b: Mixing coefficient for mixed (per-sample)
         """
-        r = np.random.rand(1)
-        if r > self.prob:
-            # No SnapMix applied, return original with identity mixing
-            lam_a = torch.ones(input.size(0), device=input.device)
-            lam_b = torch.zeros(input.size(0), device=input.device)
-            return input, target, target.clone(), lam_a, lam_b
-
         bs = input.size(0)
         device = input.device
-
-        # Generate beta distribution parameter
-        lam = np.random.beta(self.beta, self.beta)
 
         # Random permutation for batch mixing
         rand_index = torch.randperm(bs).to(device)
         target_b = target[rand_index]
 
-        # Create mixed input
-        mixed_input = input.clone()
+        apply_mask = torch.rand(bs, device=device) < self.prob
 
-        # 使用CAM引导的边界框（单bbox，更稳定）
-        if self.cam_calculator is not None:
+        lam_keep = np.random.beta(self.beta, self.beta, size=bs)
+
+        act_map = None
+        if self.activation_map_extractor is not None:
             try:
-                cam = self.cam_calculator.compute_cam(input, target)
+                act_map = self.activation_map_extractor.compute_activation_map(input, target)
             except Exception as e:
-                print(f"CAM computation failed: {e}")
-                cam = None
-        
-        # 如果有CAM，使用CAM引导的边界框；否则使用随机bbox
-        if cam is not None:
-            # CAM-guided bounding box selection
-            bbx1, bby1, bbx2, bby2 = self._cam_guided_bbox(input.size(), cam, lam)
+                print(f"Activation map computation failed: {e}")
+                act_map = None
+
+
+        if act_map is not None:
+            boxes = self._activation_guided_bbox(input.size(), act_map, lam_keep)
         else:
-            # Fallback to random bounding boxes
-            bbx1, bby1, bbx2, bby2 = self.rand_bbox(input.size(), lam)
+            boxes = self.rand_bbox(input.size(), lam_keep)
 
-        # Apply bounding box replacement
-        if bbx2 > bbx1 and bby2 > bby1:
-            ncont = input[rand_index, :, bbx1:bbx2, bby1:bby2].clone()
-            # Resize to match target region
-            if ncont.shape[2:] != (bbx2 - bbx1, bby2 - bby1):
-                ncont = torch.nn.functional.interpolate(
-                    ncont, size=(bbx2 - bbx1, bby2 - bby1),
-                    mode='bilinear', align_corners=True
-                )
-            mixed_input[:, :, bbx1:bbx2, bby1:bby2] = ncont
+        # Apply bounding box replacement per sample
+        mixed_input = input.clone()
+        H, W = input.size(-2), input.size(-1)
+        total_area = H * W
 
-        # Calculate mixing coefficients based on actual area
-        area = (bby2 - bby1) * (bbx2 - bbx1)
-        total_area = input.size(-1) * input.size(-2)
-        
-        # 基础混合系数 = 混合区域面积占比
-        lam_a = 1 - area / total_area
-        lam_b = area / total_area
-        
-        # 扩展为batch维度
-        lam_a = torch.full((bs,), lam_a, device=device)
-        lam_b = torch.full((bs,), lam_b, device=device)
+        lam_a_list = []
+        lam_b_list = []
 
-        # Handle same label case
-        same_label = target == target_b
-        if same_label.any():
-            tmp = lam_a.clone()
-            lam_a[same_label] += lam_b[same_label]
-            lam_b[same_label] += tmp[same_label]
+        for b in range(bs):
+            x1, y1, x2, y2 = boxes[b]
+            if bool(apply_mask[b]) and x2 > x1 and y2 > y1:
+                ncont = input[rand_index[b], :, y1:y2, x1:x2].clone()
+                mixed_input[b, :, y1:y2, x1:x2] = ncont
+                area = (y2 - y1) * (x2 - x1)
+            else:
+                area = 0
+
+            lam_b_val = area / total_area
+            lam_a_list.append(1.0 - lam_b_val)
+            lam_b_list.append(lam_b_val)
+
+        lam_a = torch.tensor(lam_a_list, dtype=torch.float32, device=device)
+        lam_b = torch.tensor(lam_b_list, dtype=torch.float32, device=device)
 
         # Handle NaN values
-        lam_a = torch.where(torch.isnan(lam_a), torch.ones_like(lam_a) * lam, lam_a)
-        lam_b = torch.where(torch.isnan(lam_b), torch.ones_like(lam_b) * (1 - lam), lam_b)
+        lam_a = torch.where(torch.isnan(lam_a), torch.ones_like(lam_a), lam_a)
+        lam_b = torch.where(torch.isnan(lam_b), torch.zeros_like(lam_b), lam_b)
 
-        # 确保lam_a和lam_b之和为1
         lam_sum = lam_a + lam_b
         lam_a = lam_a / lam_sum
         lam_b = lam_b / lam_sum
 
-        # 可视化调试（每100次保存一次）
         if self.save_visualizations and self.visual_count < 20:
-            self._save_visualization(input, mixed_input, cam, target, target_b, 
-                                    lam_a, lam_b, bbx1, bby1, bbx2, bby2)
+            self._save_visualization(input, mixed_input, act_map, target, target_b,
+                                    lam_a, lam_b, *boxes[0])
             self.visual_count += 1
 
         return mixed_input, target, target_b, lam_a, lam_b
     
-    def _save_visualization(self, input, mixed_input, cam, target, target_b, 
-                          lam_a, lam_b, bbx1, bby1, bbx2, bby2):
-        """保存SnapMix可视化，用于验证CAM引导是否生效"""
+    def _save_visualization(self, input, mixed_input, act_map, target, target_b, 
+                          lam_a, lam_b, x1, y1, x2, y2):
+        """Save the activation-guided CutMix visualization, which is used to verify whether the Activation map guidance works"""
         try:
             import os
             import matplotlib.pyplot as plt
@@ -480,12 +415,10 @@ class CutMixFunc:
             
             os.makedirs(self.save_visualizations, exist_ok=True)
             
-            # 只可视化第一个样本
             img_a = input[0].cpu()  # [C, H, W]
             img_b = input[torch.randperm(input.size(0))[0]].cpu()
             mixed = mixed_input[0].cpu()
             
-            # 反归一化用于显示
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             
@@ -493,120 +426,115 @@ class CutMixFunc:
                 t = t * std + mean
                 return torch.clamp(t, 0, 1)
             
-            # 转换为numpy并调整维度
             img_a_np = denorm(img_a).permute(1, 2, 0).numpy()
             mixed_np = denorm(mixed).permute(1, 2, 0).numpy()
             
             fig, axes = plt.subplots(1, 3, figsize=(12, 4))
             
-            # 原始图像
             axes[0].imshow(img_a_np)
             axes[0].set_title(f'Original (Class {target[0].item()})', fontsize=11)
             axes[0].axis('off')
             
-            # 混合图像
             axes[1].imshow(mixed_np)
             axes[1].set_title(f'Mixed (λ_a={lam_a[0].item():.2f}, λ_b={lam_b[0].item():.2f})', fontsize=11)
             axes[1].axis('off')
             
-            # 绘制混合区域
             ax = axes[1]
-            rect1 = plt.Rectangle((bby1, bbx1), bby2-bby1, bbx2-bbx1, 
+            rect1 = plt.Rectangle((x1, y1), x2-x1, y2-y1,
                                    fill=False, edgecolor='red', linewidth=2)
             ax.add_patch(rect1)
             
-            # CAM热力图
-            if cam is not None:
-                cam_np = cam[0].cpu().numpy()
-                im = axes[2].imshow(cam_np, cmap='jet')
-                axes[2].set_title('CAM (Feature Activation)', fontsize=11)
+            if act_map is not None:
+                act_map_np = act_map[0].cpu().numpy()
+                im = axes[2].imshow(act_map_np, cmap='jet')
+                axes[2].set_title('Activation Map (Feature Activation)', fontsize=11)
                 axes[2].axis('off')
                 plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
             else:
-                axes[2].text(0.5, 0.5, 'CAM Failed\n(Fallback to Random)', 
+                axes[2].text(0.5, 0.5, 'Activation Map Failed\n(Fallback to Random)', 
                            ha='center', va='center', fontsize=11)
                 axes[2].axis('off')
             
-            plt.suptitle(f'SnapMix #{self.visual_count} - CAM-guided Mixing', fontsize=12, fontweight='bold')
+            plt.suptitle(f'Activation-Guided CutMix #{self.visual_count} - Activation-Guided Mixing', fontsize=12, fontweight='bold')
             plt.tight_layout()
             
-            save_path = os.path.join(self.save_visualizations, f'snapmix_{self.visual_count:03d}.png')
+            save_path = os.path.join(self.save_visualizations, f'act_cutmix_{self.visual_count:03d}.png')
             plt.savefig(save_path, dpi=100, bbox_inches='tight')
             plt.close()
             
             if self.debug:
-                print(f"[SnapMix Debug] Saved visualization to {save_path}")
+                print(f"[Activation-Guided CutMix Debug] Saved visualization to {save_path}")
                 
         except Exception as e:
             if self.debug:
-                print(f"[SnapMix Visualization Error] {e}")
+                print(f"[Activation-Guided CutMix Visualization Error] {e}")
     
-    def _cam_guided_bbox(self, size, cam, lam, offset=0):
-        """
-        使用CAM引导生成边界框 - 在高激活区域附近选择混合区域
-        
+    def _activation_guided_bbox(self, size, act_map, lam, offset=0):
+         """
+        Use activation map to guide bounding box generation - Select mixing regions near high activation regions (sample by sample)
         Args:
-            size: 输入尺寸
-            cam: Class Activation Map [B, H, W]
-            lam: beta分布参数
-            offset: 随机偏移量
+        size: Input size [B, C, H, W]
+        act_map: Activation map [B, H, W]
+        lam: beta distribution parameter (scalar or array per sample, keep-ratio)
+        offset: A random offset
+        Returns:
+        list of (x1, y1, x2, y2), one box per sample
         """
         B, C, H, W = size
-        bs = cam.size(0)
+        bs = act_map.size(0)
         
-        cut_rat = np.sqrt(1. - lam)
-        cut_w = int(W * cut_rat)
-        cut_h = int(H * cut_rat)
+        lam_arr = np.asarray(lam, dtype=np.float64).reshape(-1)
+        if lam_arr.size == 1:
+            lam_arr = np.repeat(lam_arr, bs)
         
-        bbx1_list, bby1_list, bbx2_list, bby2_list = [], [], [], []
+        boxes = []
         
         for b in range(bs):
-            cam_b = cam[b]  # [H, W]
+            cut_rat = np.sqrt(1. - float(lam_arr[b]))
+            cut_w = int(W * cut_rat)
+            cut_h = int(H * cut_rat)
             
-            # 找到CAM激活最高的区域
-            if cam_b.max() > 0:
-                # 在高激活区域选择中心点
-                threshold = cam_b.max() * 0.5
-                high_act_mask = cam_b > threshold
+            act_map_b = act_map[b]  # [H, W]
+            
+            if act_map_b.max() > 0:
+                threshold = act_map_b.max() * 0.5
+                high_act_mask = act_map_b > threshold
                 
                 if high_act_mask.sum() > 0:
-                    # 在高激活区域随机选择中心
                     high_indices = torch.where(high_act_mask)
                     idx = np.random.randint(len(high_indices[0]))
                     cy_high = high_indices[0][idx].item()
                     cx_high = high_indices[1][idx].item()
                     
-                    # 添加随机偏移
-                    cx = np.clip(cx_high + np.random.randint(-offset, offset+1), 0, W)
-                    cy = np.clip(cy_high + np.random.randint(-offset, offset+1), 0, H)
+                    cx = int(np.clip(cx_high + np.random.randint(-offset, offset+1), 0, W))
+                    cy = int(np.clip(cy_high + np.random.randint(-offset, offset+1), 0, H))
                 else:
-                    cx, cy = np.random.randint(W), np.random.randint(H)
+                    cx = np.random.randint(W)
+                    cy = np.random.randint(H)
             else:
-                cx, cy = np.random.randint(W), np.random.randint(H)
+                cx = np.random.randint(W)
+                cy = np.random.randint(H)
             
-            bbx1 = np.clip(cx - cut_w // 2, 0, W)
-            bby1 = np.clip(cy - cut_h // 2, 0, H)
-            bbx2 = np.clip(cx + cut_w // 2, 0, W)
-            bby2 = np.clip(cy + cut_h // 2, 0, H)
+            x1 = int(np.clip(cx - cut_w // 2, 0, W))
+            y1 = int(np.clip(cy - cut_h // 2, 0, H))
+            x2 = int(np.clip(cx + cut_w // 2, 0, W))
+            y2 = int(np.clip(cy + cut_h // 2, 0, H))
             
-            bbx1_list.append(bbx1)
-            bby1_list.append(bby1)
-            bbx2_list.append(bbx2)
-            bby2_list.append(bby2)
+            boxes.append((x1, y1, x2, y2))
         
-        # 返回第一个样本的边界框（实际使用时应该处理batch）
-        return bbx1_list[0], bby1_list[0], bbx2_list[0], bby2_list[0]
+        return boxes
 
-def snapmix_data(input, target, model=None, beta=1.0, prob=1.0, num_classes=4):
+
+def act_guided_cutmix_data(input, target, model=None, beta=1.0, prob=1.0, num_classes=4):
     """
-    SnapMix data augmentation function (standalone version)
+    Activation-Guided CutMix data augmentation function (standalone version)
 
-    This is a simplified version that can work without model-specific CAM computation
-    For best results, use CutpMixFunc class with proper CAM extraction
+    This is a simplified version that can work without model-specific activation map computation
+    For best results, use ActivationGuidedCutMix class with proper activation map extraction
     """
     r = np.random.rand(1)
     if r > prob:
-        # No SnapMix applied
+        # No Activation-Guided CutMix applied
         lam_a = torch.ones(input.size(0), device=input.device)
         lam_b = torch.zeros(input.size(0), device=input.device)
         return input, target, target.clone(), lam_a, lam_b
@@ -700,7 +628,7 @@ parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
 # Dataset parameters 
 parser.add_argument('--data-dir', default='/clas/data/class2', type=str, metavar='DIR',
-                    help='path to dataset')  
+                    help='path to dataset') 
 parser.add_argument('--dataset', '-d', metavar='NAME', default='',
                     help='dataset type (default: ImageFolder/ImageTar if empty)')
 parser.add_argument('--train-split', metavar='NAME', default='train',
@@ -717,8 +645,8 @@ parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                     help='path to class to idx mapping file (default: "")')
 
 # Model parameters
-parser.add_argument('--model', default='BraXNet_t', type=str, metavar='MODEL',
-                    help='Name of model to train') 
+parser.add_argument('--model', default='MedTransXNet_t', type=str, metavar='MODEL',
+                    help='Name of model to train (default: "transxnet_progressive_asym_a4_t")') 
 parser.add_argument('--pretrained', action='store_true', default=True,
                     help='Start with pretrained version of specified network (if avail)')
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
@@ -727,7 +655,7 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
-parser.add_argument('--num-classes', type=int, default=4, metavar='N', 
+parser.add_argument('--num-classes', type=int, default=4, metavar='N', #类别
                     help='number of label classes (Model default if None)')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
@@ -861,34 +789,34 @@ parser.add_argument('--mixup-mode', type=str, default='batch',
                     help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 parser.add_argument('--mixup-off-epoch', default=0, type=int, metavar='N',
                     help='Turn off mixup after this epoch, disabled if 0 (default: 0)')
-# SnapMix parameters (MediAug: CAM-guided semantic mixing)
-parser.add_argument('--snapmix', action='store_true', default=True,
-                    help='Enable SnapMix augmentation (CAM-guided semantic mixing)')
-parser.add_argument('--snapmix-beta', type=float, default=1.0,
-                    help='SnapMix beta parameter for beta distribution (default: 1.0)')
-parser.add_argument('--snapmix-prob', type=float, default=1.0,
-                    help='Probability of applying SnapMix when enabled (default: 1.0)')
-parser.add_argument('--snapmix-cls-weights', action='store_true', default=False,
-                    help='Use class weights for CAM computation in SnapMix')
-parser.add_argument('--snapmix-debug', action='store_true', default=False,
-                    help='Enable SnapMix debug mode (print CAM stats)')
-parser.add_argument('--snapmix-visualize', type=str, default=None,
-                    help='Save SnapMix visualization to this directory (e.g., ./snapmix_debug)')
-# SnapMix Asymmetric Loss parameters
-parser.add_argument('--asym-loss', action='store_true', default=True,
-                    help='Enable Asymmetric Loss for SnapMix (default: True)')
-parser.add_argument('--asym-gamma-neg', type=float, default=2.0,
-                    help='Asymmetric Loss negative gamma parameter (default: 2.0)')
-parser.add_argument('--asym-gamma-pos', type=float, default=0.5,
-                    help='Asymmetric Loss positive gamma parameter (default: 0.5)')
-parser.add_argument('--asym-clip', type=float, default=0.03,
-                    help='Asymmetric Loss clipping parameter (default: 0.03)')
-parser.add_argument('--asym-mixup-weight', action='store_true', default=True,
-                    help='Enable SnapMix adaptive weighting (default: True)')
-parser.add_argument('--asym-progressive', action='store_true', default=True,
-                    help='Enable progressive gamma adjustment (default: True)')
-parser.add_argument('--asym-warmup-epochs', type=int, default=10,
-                    help='Warmup epochs for progressive asymmetric loss (default: 10)')
+# Activation-Guided CutMix parameters (activation-map-guided semantic mixing)
+parser.add_argument('--act-cutmix', '--snapmix', dest='act_cutmix', action='store_true', default=True,
+                    help='Enable Activation-Guided CutMix augmentation (activation-map guided mixing)')
+parser.add_argument('--act-cutmix-beta', '--snapmix-beta', dest='act_cutmix_beta', type=float, default=1.0,
+                    help='Beta parameter of the mixing-ratio distribution (default: 1.0)')
+parser.add_argument('--act-cutmix-prob', '--snapmix-prob', dest='act_cutmix_prob', type=float, default=0.5,
+                    help='Per-sample probability of applying Activation-Guided CutMix (default: 0.5)')
+parser.add_argument('--act-cutmix-cls-weights', '--snapmix-cls-weights', dest='act_cutmix_cls_weights', action='store_true', default=False,
+                    help='Use class weights for activation map computation')
+parser.add_argument('--act-cutmix-debug', '--snapmix-debug', dest='act_cutmix_debug', action='store_true', default=False,
+                    help='Enable Activation-Guided CutMix debug mode (print activation map stats)')
+parser.add_argument('--act-cutmix-visualize', '--snapmix-visualize', dest='act_cutmix_visualize', type=str, default=None,
+                    help='Save Activation-Guided CutMix visualization to this directory (e.g., ./act_cutmix_debug)')
+# PSALoss parameters (Progressive Soft Asymmetric Loss)
+parser.add_argument('--psa-loss', '--asym-loss', dest='psa_loss', action='store_true', default=True,
+                    help='Enable PSALoss for Activation-Guided CutMix (default: True)')
+parser.add_argument('--psa-gamma-neg', '--asym-gamma-neg', dest='psa_gamma_neg', type=float, default=2.0,
+                    help='PSALoss negative-class focusing parameter gamma_neg (default: 2.0)')
+parser.add_argument('--psa-gamma-pos', '--asym-gamma-pos', dest='psa_gamma_pos', type=float, default=0.5,
+                    help='PSALoss positive-class focusing parameter gamma_pos (default: 0.5)')
+parser.add_argument('--psa-clip', '--asym-clip', dest='psa_clip', type=float, default=0.03,
+                    help='PSALoss probability clipping alpha (default: 0.03)')
+parser.add_argument('--psa-adaptive-weight', '--asym-mixup-weight', dest='psa_adaptive_weight', action='store_true', default=True,
+                    help='Enable the adaptive weighting w_adaptive for mixed samples (default: True)')
+parser.add_argument('--psa-progressive', '--asym-progressive', dest='psa_progressive', action='store_true', default=True,
+                    help='Enable the progressive schedule of w_as (default: True)')
+parser.add_argument('--psa-warmup-epochs', '--asym-warmup-epochs', dest='psa_warmup_epochs', type=int, default=10,
+                    help='Warm-up epochs of the progressive schedule w_as (default: 10)')
 parser.add_argument('--smoothing', type=float, default=0.1,
                     help='Label smoothing (default: 0.1)')
 parser.add_argument('--train-interpolation', type=str, default='random',
@@ -1242,19 +1170,19 @@ def main():
             download=args.dataset_download,
             batch_size=args.batch_size)
 
-    # setup mixup / cutmix / SnapMix
+    # setup mixup / cutmix / Activation-Guided CutMix
     collate_fn = None
     mixup_fn = None
-    snapmix_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None or args.snapmix
+    act_cutmix_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None or args.act_cutmix
     if mixup_active:
-        # Check if SnapMix is enabled
-        if args.snapmix:
-            # Use SnapMix instead of Mixup/CutMix
-            _logger.info(f"Enabling SnapMix with beta={args.snapmix_beta}, prob={args.snapmix_prob}")
-            # Note: SnapMix requires model for CAM computation
-            # We'll create the snapmix_fn after model is created
-            snapmix_active = True
+        # Check if Activation-Guided CutMix is enabled
+        if args.act_cutmix:
+            # Use Activation-Guided CutMix instead of Mixup/CutMix
+            _logger.info(f"Enabling Activation-Guided CutMix with beta={args.act_cutmix_beta}, prob={args.act_cutmix_prob}")
+            # Note: Activation-Guided CutMix requires model for activation map computation
+            # We'll create the act_cutmix_fn after model is created
+            act_cutmix_active = True
         else:
             # Original Mixup/CutMix
             mixup_args = dict(
@@ -1321,49 +1249,49 @@ def main():
         pin_memory=args.pin_mem,
     )
 
-    # Initialize SnapMix function if enabled (after model is created)
-    snapmix_fn = None
-    if args.snapmix:
-        _logger.info("Initializing SnapMix augmentation...")
-        snapmix_fn = CutpMixFunc(
+    # Initialize Activation-Guided CutMix function if enabled (after model is created)
+    act_cutmix_fn = None
+    if args.act_cutmix:
+        _logger.info("Initializing Activation-Guided CutMix augmentation...")
+        act_cutmix_fn = ActivationGuidedCutMix(
             model=model,
-            beta=args.snapmix_beta,
-            prob=args.snapmix_prob,
+            beta=args.act_cutmix_beta,
+            prob=args.act_cutmix_prob,
             num_classes=args.num_classes,
-            use_cls_weights=args.snapmix_cls_weights,
-            debug=args.snapmix_debug,
-            save_visualizations=args.snapmix_visualize
+            use_cls_weights=args.act_cutmix_cls_weights,
+            debug=args.act_cutmix_debug,
+            save_visualizations=args.act_cutmix_visualize
         )
-        _logger.info(f"SnapMix initialized with beta={args.snapmix_beta}, prob={args.snapmix_prob}")
-        if args.snapmix_debug:
-            _logger.info("SnapMix debug mode enabled")
-        if args.snapmix_visualize:
-            _logger.info(f"SnapMix visualizations will be saved to: {args.snapmix_visualize}")
+        _logger.info(f"Activation-Guided CutMix initialized with beta={args.act_cutmix_beta}, prob={args.act_cutmix_prob}")
+        if args.act_cutmix_debug:
+            _logger.info("Activation-Guided CutMix debug mode enabled")
+        if args.act_cutmix_visualize:
+            _logger.info(f"Activation-Guided CutMix visualizations will be saved to: {args.act_cutmix_visualize}")
 
     # setup loss function
-    # Note: SnapMix uses soft labels with Asymmetric Loss
+    # Note: Activation-Guided CutMix uses soft labels with PSALoss
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(
             num_splits=num_aug_splits, smoothing=args.smoothing)
-    elif args.snapmix:
-        # SnapMix with Progressive Asymmetric Loss (稳定版)
-        if args.asym_loss:
-            _logger.info(f"Using ProgressiveSoftAsymmetricLoss: "
-                        f"gamma_neg={args.asym_gamma_neg}, gamma_pos={args.asym_gamma_pos}, "
-                        f"clip={args.asym_clip}, warmup={args.asym_warmup_epochs}")
-            train_loss_fn = ProgressiveSoftAsymmetricLoss(
-                gamma_neg=args.asym_gamma_neg,
-                gamma_pos=args.asym_gamma_pos,
-                clip=args.asym_clip,
-                warmup_epochs=args.asym_warmup_epochs,
+    elif args.act_cutmix:
+        # Activation-Guided CutMix with Progressive Soft Asymmetric Loss (PSALoss)
+        if args.psa_loss:
+            _logger.info(f"Using PSALoss: "
+                        f"gamma_neg={args.psa_gamma_neg}, gamma_pos={args.psa_gamma_pos}, "
+                        f"clip={args.psa_clip}, warmup={args.psa_warmup_epochs}")
+            train_loss_fn = PSALoss(
+                gamma_neg=args.psa_gamma_neg,
+                gamma_pos=args.psa_gamma_pos,
+                clip=args.psa_clip,
+                warmup_epochs=args.psa_warmup_epochs,
                 total_epochs=args.epochs,
                 smoothing=args.smoothing,
-                mixup_adaptive_weight=args.asym_mixup_weight,
-                progressive_combination=args.asym_progressive
+                adaptive_weight=args.psa_adaptive_weight,
+                progressive_enabled=args.psa_progressive
             )
         else:
-            _logger.info("Using SoftTargetCrossEntropy for SnapMix")
+            _logger.info("Using SoftTargetCrossEntropy for Activation-Guided CutMix")
             train_loss_fn = SoftTargetCrossEntropy()
     elif mixup_active:
         # smoothing is handled with mixup target transform which outputs sparse, soft targets
@@ -1414,7 +1342,6 @@ def main():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
     try:
-        # 添加整体训练进度条
         if args.rank == 0:
             from datetime import timedelta
             start_time = time.time()
@@ -1425,7 +1352,6 @@ def main():
                                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         for epoch in range(start_epoch, num_epochs):
-            # 设置epoch用于渐进式损失计算
             if hasattr(train_loss_fn, 'set_epoch'):
                 train_loss_fn.set_epoch(epoch)
             
@@ -1440,7 +1366,7 @@ def main():
                 amp_autocast=amp_autocast, 
                 loss_scaler=loss_scaler, 
                 model_ema=model_ema, mixup_fn=mixup_fn,
-                snapmix_fn=snapmix_fn,
+                act_cutmix_fn=act_cutmix_fn,
                 num_epochs=num_epochs)
 
             if (epoch % args.val_freq == 0) or epoch > args.val_start_epoch or resume_mode:
@@ -1484,14 +1410,12 @@ def main():
                 best_metric, best_epoch = saver.save_checkpoint(
                     epoch, metric=save_metric)
 
-            # 更新整体进度条
             if args.rank == 0:
                 overall_pbar.update(1)
 
     except KeyboardInterrupt:
         pass
 
-    # 关闭整体进度条并显示总训练时间
     if args.rank == 0:
         overall_pbar.close()
         total_time = time.time() - start_time
@@ -1507,7 +1431,7 @@ def main():
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None, snapmix_fn=None, num_epochs=None):
+        loss_scaler=None, model_ema=None, mixup_fn=None, act_cutmix_fn=None, num_epochs=None):
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1528,7 +1452,6 @@ def train_one_epoch(
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     
-    # 添加进度条
     epoch_str = f'{epoch}/{num_epochs-1}' if num_epochs else str(epoch)
     pbar = tqdm(enumerate(loader), total=len(loader), 
                 desc=f'Epoch {epoch_str} [Train]',
@@ -1539,54 +1462,54 @@ def train_one_epoch(
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         # Flags for augmentation
-        use_snapmix = snapmix_fn is not None
+        use_act_cutmix = act_cutmix_fn is not None
         target_a, target_b, lam_a, lam_b = None, None, None, None
 
         if not args.prefetcher:
             input = input.cuda()
             target = target.cuda()
-            # Apply SnapMix or Mixup/CutMix
-            if use_snapmix:
-                # Use SnapMix augmentation
-                input, target_a, target_b, lam_a, lam_b = snapmix_fn(input, target)
-            elif mixup_fn is not None:
-                input, target = mixup_fn(input, target)
+
+        # Apply Activation-Guided CutMix (activation-map guided) — must run in the training loop because it
+        # needs the model on GPU for activation-map computation, so it cannot be
+        # delegated to the prefetcher/collate pipeline.
+        if use_act_cutmix:
+            if not input.is_cuda:
+                input = input.cuda()
+                target = target.cuda()
+            input, target_a, target_b, lam_a, lam_b = act_cutmix_fn(input, target)
+        elif not args.prefetcher and mixup_fn is not None:
+            input, target = mixup_fn(input, target)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
             output = model(input)
-            # Compute loss for SnapMix with Asymmetric Loss
-            if use_snapmix:
-                # 检查是否实际应用了SnapMix（通过lam_b是否大于0来判断）
+            # Compute loss for Activation-Guided CutMix with PSALoss
+            if use_act_cutmix:
                 if target_a is not None and lam_b is not None and lam_b.sum().item() > 0:
-                    # SnapMix需要将类别索引转换为one-hot软标签
+                    # Activation-Guided CutMix需要将类别索引转换为one-hot软标签
                     num_classes = output.size(-1)
                     batch_size = target_a.size(0)
 
-                    # 转换为one-hot编码
                     target_a_onehot = torch.zeros(batch_size, num_classes, device=output.device)
                     target_b_onehot = torch.zeros(batch_size, num_classes, device=output.device)
 
                     target_a_onehot.scatter_(1, target_a.view(-1, 1), 1)
                     target_b_onehot.scatter_(1, target_b.view(-1, 1), 1)
 
-                    # 使用lam_a和lam_b混合软标签
                     target_mixed = lam_a.view(-1, 1) * target_a_onehot + lam_b.view(-1, 1) * target_b_onehot
 
-                    # 使用ProgressiveSoftAsymmetricLoss计算损失（传递epoch和num_epochs用于渐进式调整）
                     if hasattr(loss_fn, 'forward') and hasattr(loss_fn, 'progressive_adjust'):
                         loss = loss_fn(output, target_mixed, lam_a, lam_b, epoch, num_epochs)
                     else:
                         loss = loss_fn(output, target_mixed)
                 else:
-                    # SnapMix未应用时，将硬标签转换为软标签
                     num_classes = output.size(-1)
                     batch_size = target.size(0)
                     target_soft = torch.zeros(batch_size, num_classes, device=output.device)
                     target_soft.scatter_(1, target.view(-1, 1), 1)
                     
-                    # 使用ProgressiveSoftAsymmetricLoss计算损失
+                    # use PSALoss
                     if hasattr(loss_fn, 'forward') and hasattr(loss_fn, 'progressive_adjust'):
                         lam_a_dummy = torch.ones(batch_size, device=output.device)
                         lam_b_dummy = torch.zeros(batch_size, device=output.device)
@@ -1631,14 +1554,12 @@ def train_one_epoch(
             lr = sum(lrl) / len(lrl)
 
             if args.local_rank == 0:
-                # 更新进度条显示
                 pbar.set_postfix({
                     'Loss': f'{losses_m.avg:.4f}',
                     'LR': f'{lr:.2e}',
                     'Speed': f'{input.size(0) * args.world_size / batch_time_m.avg:.1f} img/s'
                 })
                 
-                # 仍然记录详细日志（可选，减少频率）
                 if batch_idx % (args.log_interval * 5) == 0 or last_batch:
                     current_time = time.strftime(
                         '%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
@@ -1695,7 +1616,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     top1_m = AverageMeter()
     top5_m = AverageMeter()
     
-    # 收集所有预测和标签用于计算医学指标
     all_preds = []
     all_targets = []
     all_probs = []
@@ -1705,7 +1625,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     end = time.time()
     last_idx = len(loader) - 1
     
-    # 添加验证进度条
     pbar = tqdm(enumerate(loader), total=len(loader),
                 desc='[Validate]',
                 disable=args.local_rank != 0,
@@ -1759,14 +1678,12 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
             end = time.time()
             
             if args.local_rank == 0:
-                # 更新验证进度条
                 pbar.set_postfix({
                     'Loss': f'{losses_m.avg:.4f}',
                     'Acc@1': f'{top1_m.avg:.2f}%',
                     'Acc@5': f'{top5_m.avg:.2f}%'
                 })
                 
-                # 详细日志（减少频率）
                 if last_batch or batch_idx % max(1, args.log_interval // 2) == 0:
                     log_name = 'Test' + log_suffix
                     _logger.info(
@@ -1780,17 +1697,15 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     
     pbar.close()
     
-    # 计算医学分类指标
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     all_probs = np.array(all_probs)
     
-    # Precision, Recall, F1 (macro平均)
+    # Precision, Recall, F1 (macro)
     precision_macro = precision_score(all_targets, all_preds, average='macro', zero_division=0)
     recall_macro = recall_score(all_targets, all_preds, average='macro', zero_division=0)
     f1_macro = f1_score(all_targets, all_preds, average='macro', zero_division=0)
     
-    # 计算AUC (多分类使用ovr策略)
     try:
         auc_macro = roc_auc_score(all_targets, all_probs, multi_class='ovr', average='macro')
     except:
@@ -1798,7 +1713,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
     metrics = OrderedDict([
         (f'loss{log_suffix}', losses_m.avg),
-        (f'top1{log_suffix}', top1_m.avg),  # 准确率
+        (f'top1{log_suffix}', top1_m.avg), 
         (f'top5{log_suffix}', top5_m.avg),
         (f'precision{log_suffix}', precision_macro * 100),
         (f'recall{log_suffix}', recall_macro * 100),
