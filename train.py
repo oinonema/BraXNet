@@ -645,7 +645,7 @@ parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                     help='path to class to idx mapping file (default: "")')
 
 # Model parameters
-parser.add_argument('--model', default='MedTransXNet_t', type=str, metavar='MODEL',
+parser.add_argument('--model', default='BraXNet_t', type=str, metavar='MODEL',
                     help='Name of model to train (default: "transxnet_progressive_asym_a4_t")') 
 parser.add_argument('--pretrained', action='store_true', default=True,
                     help='Start with pretrained version of specified network (if avail)')
